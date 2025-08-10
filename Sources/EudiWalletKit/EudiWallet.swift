@@ -29,11 +29,14 @@ import Logging
 import FileLogging
 import UIKit
 #endif
+import nobid_core
 
 /// User wallet implementation
 public final class EudiWallet: ObservableObject, @unchecked Sendable {
 	/// Storage manager instance
-	public private(set) var storage: StorageManager!
+	// <C><NOBID><IPSZ> required to support multiple instances of EudiWallet but all sharing the storage so newly added documents are visible in all instances
+	public var storage: StorageManager!
+	//public private(set) var storage: StorageManager!
 	public private(set) var serviceName: String
 	/// The [access group](https://developer.apple.com/documentation/security/ksecattraccessgroup) that documents are stored in.
 	public private(set) var accessGroup: String?
@@ -61,6 +64,9 @@ public final class EudiWallet: ObservableObject, @unchecked Sendable {
 	public var logFileName: String? { didSet { try? initializeLogging() } }
 	//public static let defaultOpenId4VCIConfig =
 	public static let defaultServiceName = "eudiw"
+	let paymentContext: NobidPaymentContext
+	let configurationContext: NobidConfigurationContext
+	let signerService: NobidSignerService
 	/// Initialize a wallet instance. All parameters are optional.
 	/// - Parameters:
 	///   - storageType: The type of storage to use. Defaults to `.keyChain`.
@@ -81,7 +87,7 @@ public final class EudiWallet: ObservableObject, @unchecked Sendable {
 	/// ```swift
 	/// let wallet = try! EudiWallet(serviceName: "my_wallet_app", trustedReaderCertificates: [Data(name: "eudi_pid_issuer_ut", ext: "der")!])
 	/// ```
-	public init(storageType: StorageType = .keyChain, serviceName: String? = nil, accessGroup: String? = nil, trustedReaderCertificates: [Data]? = nil, userAuthenticationRequired: Bool = true, verifierApiUri: String? = nil, openID4VciIssuerUrl: String? = nil, openID4VciConfig: OpenId4VCIConfiguration? = nil, urlSession: URLSession? = nil, logFileName: String? = nil, secureAreas: [any SecureArea]? = nil, modelFactory: (any DocClaimsDecodableFactory)? = nil) throws {
+	public init(storageType: StorageType = .keyChain, serviceName: String? = nil, accessGroup: String? = nil, trustedReaderCertificates: [Data]? = nil, userAuthenticationRequired: Bool = true, verifierApiUri: String? = nil, openID4VciIssuerUrl: String? = nil, openID4VciConfig: OpenId4VCIConfiguration? = nil, urlSession: URLSession? = nil, logFileName: String? = nil, secureAreas: [any SecureArea]? = nil, modelFactory: (any DocClaimsDecodableFactory)? = nil, configurationContext: NobidConfigurationContext, signerService: NobidSignerService, paymentContext: NobidPaymentContext) throws {
 
 		try Self.validateServiceParams(serviceName: serviceName)
 		self.serviceName = serviceName ?? Self.defaultServiceName
@@ -97,6 +103,9 @@ public final class EudiWallet: ObservableObject, @unchecked Sendable {
 		self.openID4VciConfig = openID4VciConfig ?? OpenId4VCIConfiguration()
 		self.urlSession = urlSession ?? URLSession.shared
 		self.logFileName = logFileName
+		self.configurationContext = configurationContext
+		self.signerService = signerService
+		self.paymentContext = paymentContext
 		storage = self.getStorage()
 		if let secureAreas, !secureAreas.isEmpty {
 			for asa in secureAreas { SecureAreaRegistry.shared.register(secureArea: asa) }
@@ -149,7 +158,10 @@ public final class EudiWallet: ObservableObject, @unchecked Sendable {
 		try FileManager.default.removeItem(at: logFileURL)
 	}
 
+	nonisolated(unsafe) static var loggingIsInitialized = false // <C> Used so we can have mulitple instances of EudiWallet which is needed for IPSZ configuration;
+	
 	private func initializeLogging() throws {
+		guard !Self.loggingIsInitialized else { return }
 		LoggingSystem.bootstrap { [logFileName] label in
 			var handlers:[LogHandler] = []
 			if _isDebugAssertConfiguration() {
@@ -165,6 +177,16 @@ public final class EudiWallet: ObservableObject, @unchecked Sendable {
 					} catch { fatalError("Logging setup failed: \(error.localizedDescription)") }
 				}
 			#endif
+            
+            // <NOBID> This must be here because LoggingSystem.bootstrap()
+            // may be called only once. If we call it again, it will crash.
+            //
+            for var handler in handlers {
+                handler.logLevel = Logger.Level.trace
+            }
+			Self.loggingIsInitialized = true
+            // </NOBID>
+
 			return MultiplexLogHandler(handlers)
 		}
 	}
@@ -180,7 +202,7 @@ public final class EudiWallet: ObservableObject, @unchecked Sendable {
 			return try await beginIssueDocument(id: id, keyOptions: keyOptions)
 		}, disabled: !userAuthenticationRequired || disablePrompt, dismiss: {}, localizedReason: promptMessage ?? NSLocalizedString("issue_document", comment: "").replacingOccurrences(of: "{docType}", with: NSLocalizedString(displayName ?? docType ?? "", comment: "")))
 		guard let issueReq else { throw LAError(.userCancel)}
-		let openId4VCIService = await OpenId4VCIService(issueRequest: issueReq, credentialIssuerURL: openID4VciIssuerUrl, uiCulture: uiCulture, config: openID4VciConfig.toOpenId4VCIConfig(), urlSession: urlSession)
+		let openId4VCIService = await OpenId4VCIService(issueRequest: issueReq, credentialIssuerURL: openID4VciIssuerUrl, uiCulture: uiCulture, config: openID4VciConfig.toOpenId4VCIConfig(), urlSession: urlSession, configurationContext: configurationContext, signerService: signerService)
 		return openId4VCIService
 	}
 
@@ -216,7 +238,7 @@ public final class EudiWallet: ObservableObject, @unchecked Sendable {
 	@discardableResult public func requestDeferredIssuance(deferredDoc: WalletStorage.Document, keyOptions: KeyOptions? = nil) async throws -> WalletStorage.Document {
 		guard deferredDoc.status == .deferred else { throw WalletError(description: "Invalid document status") }
 		let issueReq = try IssueRequest(id: deferredDoc.id, keyOptions: keyOptions)
-		let openId4VCIService = await OpenId4VCIService(issueRequest: issueReq, credentialIssuerURL: "", uiCulture: uiCulture, config: self.openID4VciConfig.toOpenId4VCIConfig(), urlSession: urlSession)
+		let openId4VCIService = await OpenId4VCIService(issueRequest: issueReq, credentialIssuerURL: "", uiCulture: uiCulture, config: self.openID4VciConfig.toOpenId4VCIConfig(), urlSession: urlSession, configurationContext: configurationContext, signerService: signerService)
 		let data = try await openId4VCIService.requestDeferredIssuance(deferredDoc: deferredDoc)
 		guard case .issued(_, _, _) = data else { return deferredDoc }
 		return try await finalizeIssuing(issueOutcome: data, docType: deferredDoc.docType, format: deferredDoc.docDataFormat, issueReq: issueReq, openId4VCIService: openId4VCIService)
@@ -288,19 +310,27 @@ public final class EudiWallet: ObservableObject, @unchecked Sendable {
 	///   - claimSet: claim set (optional)
 	/// - Returns: Array of issued and stored documents
 	public func issueDocumentsByOfferUrl(offerUri: String, docTypes: [OfferedDocModel], docTypeKeyOptions: [String: KeyOptions]? = nil, txCodeValue: String? = nil, promptMessage: String? = nil, claimSet: ClaimSet? = nil) async throws -> [WalletStorage.Document] {
+        NobidLogger.debug("Step: issueDocumentsByOfferUrl: 1: offerUr=\(offerUri); docTypes=\(docTypes.map{$0.docType ?? "NIL"}.joined(separator: "-")); txCodeValue=\(txCodeValue); claimSet=\(claimSet)")
 		if docTypes.isEmpty { return [] }
+        NobidLogger.debug("Step: issueDocumentsByOfferUrl: 2")
 		var documents = [WalletStorage.Document]()
 		var openId4VCIServices = [OpenId4VCIService]()
 		for (i, docTypeModel) in docTypes.enumerated() {
 			openId4VCIServices.append(try await prepareIssuing(id: UUID().uuidString, docType: i > 0 ? "" : docTypes.map(\.docTypeOrScope).joined(separator: ", "), displayName: i > 0 ? nil : docTypes.map(\.displayName).joined(separator: ", "), keyOptions: docTypeKeyOptions?[docTypeModel.docTypeOrScope], disablePrompt: i > 0, promptMessage: promptMessage))
 		}
+        NobidLogger.debug("Step: issueDocumentsByOfferUrl: 4: prepareIssuing done")
 		let (auth, credentialInfos) = try await openId4VCIServices.first!.authorizeOffer(offerUri: offerUri, docTypeModels: docTypes, txCodeValue: txCodeValue)
+        NobidLogger.debug("Step: issueDocumentsByOfferUrl: 5: authorizeOffer done: openId4VCIServices.count=\(openId4VCIServices.count)")
 		for (i, openId4VCIService) in openId4VCIServices.enumerated() {
+            NobidLogger.debug("Step: issueDocumentsByOfferUrl: 6: issueDocumentByOfferUrl STARTED: i=\(i); openId4VCIService.issuer=\(openId4VCIService.credentialIssuerURL)")
+
 			if i > 0 { await openId4VCIServices[i].setBindingKey(bindingKey: await openId4VCIServices.first!.bindingKey) }
 			guard let offer = await OpenId4VCIService.metadataCache[offerUri] else { throw WalletError(description: "offerUri not resolved. resolveOfferDocTypes must be called first")}
 			guard let docData = try await openId4VCIService.issueDocumentByOfferUrl(offer: offer, authorizedOutcome: auth, configuration: credentialInfos[i], promptMessage: promptMessage, claimSet: claimSet) else { continue }
 			documents.append(try await finalizeIssuing(issueOutcome: docData, docType: docTypes[i].docTypeOrScope, format: credentialInfos[i].format, issueReq: openId4VCIService.issueReq, openId4VCIService: openId4VCIService))
+            NobidLogger.debug("Step: issueDocumentsByOfferUrl: 6: issueDocumentByOfferUrl DONE")
 		}
+        NobidLogger.debug("Step: issueDocumentsByOfferUrl: 7: issueDocumentByOfferUrl ALL done")
 		await OpenId4VCIService.removeOfferFromMetadata(offerUri: offerUri)
 		return documents
 	}
@@ -434,20 +464,23 @@ public final class EudiWallet: ObservableObject, @unchecked Sendable {
 	/// - Returns: A presentation session instance,
 	public func beginPresentation(flow: FlowType, docType: String? = nil) async -> PresentationSession {
 		do {
+            NobidLogger.debug("VP: beginPresentation: 1: flow=\(flow); docType=\(docType ?? "NIL")")
 			let parameters = try await prepareServiceDataParameters(docType: docType, format: flow == .ble ? .cbor : nil)
 			let docIdToPresentInfo = await storage.getDocIdsToPresentInfo()
 			switch flow {
 			case .ble:
+                NobidLogger.debug("VP: beginPresentation: 2: BLE")
 				let bleSvc = try BlePresentationService(parameters: parameters)
-				return PresentationSession(presentationService: bleSvc, docIdToPresentInfo: docIdToPresentInfo, userAuthenticationRequired: userAuthenticationRequired)
+				return PresentationSession(presentationService: bleSvc, docIdToPresentInfo: docIdToPresentInfo, userAuthenticationRequired: userAuthenticationRequired, paymentContext: paymentContext, storage: storage)
 			case .openid4vp(let qrCode):
+                NobidLogger.debug("VP: beginPresentation: 3: openid4vp")
 				let openIdSvc = try OpenId4VpService(parameters: parameters, qrCode: qrCode, openId4VpVerifierApiUri: self.verifierApiUri, openId4VpVerifierLegalName: self.verifierLegalName, urlSession: urlSession)
-				return PresentationSession(presentationService: openIdSvc, docIdToPresentInfo: docIdToPresentInfo, userAuthenticationRequired: userAuthenticationRequired)
+				return PresentationSession(presentationService: openIdSvc, docIdToPresentInfo: docIdToPresentInfo, userAuthenticationRequired: userAuthenticationRequired, paymentContext: paymentContext, storage: storage)
 			default:
-				return PresentationSession(presentationService: FaultPresentationService(error: PresentationSession.makeError(str: "Use beginPresentation(service:)")), docIdToPresentInfo: docIdToPresentInfo, userAuthenticationRequired: false)
+				return PresentationSession(presentationService: FaultPresentationService(error: PresentationSession.makeError(str: "Use beginPresentation(service:)")), docIdToPresentInfo: docIdToPresentInfo, userAuthenticationRequired: false, paymentContext: paymentContext, storage: storage)
 			}
 		} catch {
-			return PresentationSession(presentationService: FaultPresentationService(error: error), docIdToPresentInfo: [:], userAuthenticationRequired: false)
+			return PresentationSession(presentationService: FaultPresentationService(error: error), docIdToPresentInfo: [:], userAuthenticationRequired: false, paymentContext: paymentContext, storage: storage)
 		}
 	}
 
@@ -458,7 +491,7 @@ public final class EudiWallet: ObservableObject, @unchecked Sendable {
 	///   - docType: DocType of documents to present (optional)
 	/// - Returns: A `PresentationSession` instance,
 	public func beginPresentation(service: any PresentationService) async -> PresentationSession {
-		return PresentationSession(presentationService: service, docIdToPresentInfo: await storage.getDocIdsToPresentInfo(), userAuthenticationRequired: userAuthenticationRequired)
+		return PresentationSession(presentationService: service, docIdToPresentInfo: await storage.getDocIdsToPresentInfo(), userAuthenticationRequired: userAuthenticationRequired, paymentContext: paymentContext, storage: storage)
 	}
 
 	/// Perform an action after user authorization via TouchID/FaceID/Passcode

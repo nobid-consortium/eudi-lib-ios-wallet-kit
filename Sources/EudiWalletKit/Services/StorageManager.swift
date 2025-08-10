@@ -23,6 +23,7 @@ import CryptoKit
 import eudi_lib_sdjwt_swift
 import SwiftyJSON
 import OpenID4VCI
+import nobid_core
 
 /// Storage manager. Provides services and view models
 public final class StorageManager: ObservableObject, @unchecked Sendable {
@@ -165,17 +166,26 @@ public final class StorageManager: ObservableObject, @unchecked Sendable {
 
 	static func recreateSdJwtClaims(docData: Data) -> (json: JSON, hashingAlg: String)? {
 		let parser = CompactParser()
+        NobidLogger.debug("recreateSdJwtClaims: 1")
 		guard let serString = String(data: docData, encoding: .utf8) else { logger.error("Failed to convert document data to UTF8 string"); return nil}
+        NobidLogger.debug("recreateSdJwtClaims: 2: serString=\(serString)")
 		guard let sdJwt = try? parser.getSignedSdJwt(serialisedString: serString) else { logger.error("Failed to parse serialized SDJWT"); return nil }
+        NobidLogger.debug("recreateSdJwtClaims: 3")
+
 		var recreatedClaims: JSON?; var hashingAlg: String?
 		do {
 			let result = try sdJwt.recreateClaims()
+            NobidLogger.debug("recreateSdJwtClaims: 4")
 			let (_, payload, _) = extractJWTParts(sdJwt.jwt.compactSerialization)
+            NobidLogger.debug("recreateSdJwtClaims: 5")
 			guard let paylodData = Data(base64URLEncoded: payload), let payload = try? JSON(data: paylodData) else { logger.error("Failed to base64url decode payload"); return nil }
+            NobidLogger.debug("recreateSdJwtClaims: 6")
 			hashingAlg = try payload.extractDigestAlgorithm()
 			recreatedClaims = result.recreatedClaims
+            NobidLogger.debug("recreateSdJwtClaims: 7")
 		} catch { logger.error("Failed to recreate claims from SDJWT: \(error)") }
 		guard let recreatedClaims, let hashingAlg else { return nil }
+        NobidLogger.success("recreateSdJwtClaims: 8")
 		return (recreatedClaims, hashingAlg)
 	}
 
@@ -208,6 +218,7 @@ public final class StorageManager: ObservableObject, @unchecked Sendable {
 			let docs2 = docs.map { d in WalletStorage.Document(id: d.id, docType: d.docType, docDataFormat: d.docDataFormat, data: d.data, secureAreaName: d.secureAreaName,
 			 createdAt: d.createdAt, modifiedAt: d.modifiedAt, metadata: d.metadata, displayName: d.getDisplayName(uiCulture), status: d.status)   }
 			await refreshDocModels(docs2, uiCulture: uiCulture, docStatus: status)
+            NobidLogger.debug("local documents loaded count=\(docs2.count)")
 			await refreshPublishedVars()
 			return docs
 		} catch {

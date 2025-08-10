@@ -25,8 +25,11 @@ import WalletStorage
 @preconcurrency import SiopOpenID4VP
 import eudi_lib_sdjwt_swift
 import JOSESwift
+import SwiftyJSON
 import Logging
 import X509
+import nobid_core
+
 /// Implements remote attestation presentation to online verifier
 
 /// Implementation is based on the OpenID4VP specification
@@ -43,7 +46,7 @@ public final class OpenId4VpService: @unchecked Sendable, PresentationService {
 	/// map of document id to document type
 	var idsToDocTypes: [String: String]!
 	// map of document-id to SignedSDJWT
-	var docsSdJwt: [String: SignedSDJWT]!
+	public var docsSdJwt: [String: SignedSDJWT]!
 	// map of document-id to hashing algorithm
 	var docsHashingAlgs: [String: String]!
 	/// IACA root certificates
@@ -64,7 +67,7 @@ public final class OpenId4VpService: @unchecked Sendable, PresentationService {
 	var readerCertificateIssuer: String?
 	var readerCertificateValidationMessage: String?
 	var vpNonce: String!
-	var vpClientId: String!
+    var vpClientId: String!
 	var mdocGeneratedNonce: String!
 	var sessionTranscript: SessionTranscript!
 	var eReaderPub: CoseKey?
@@ -99,23 +102,32 @@ public final class OpenId4VpService: @unchecked Sendable, PresentationService {
 		}
 		return ""
 	}
+	
 
 	///  Receive request from an openid4vp URL
 	///
 	/// - Returns: The requested items.
 	public func receiveRequest() async throws -> UserRequestInfo {
-		guard status != .error, let openid4VPURI = URL(string: openid4VPlink) else { throw PresentationSession.makeError(str: "Invalid link \(openid4VPlink)") }
-		siopOpenId4Vp = SiopOpenID4VP(walletConfiguration: getWalletConf(verifierApiUrl: openId4VpVerifierApiUri, verifierLegalName: openId4VpVerifierLegalName))
+        NobidLogger.debug("VP: receiveRequest: 1:")
+        NobidLogger.dump("VP: receiveRequest: 1A: docsSdJwt=\(docsSdJwt)")
+		guard status != .error, let openid4VPURI = NobidUtilities.createVpUrl(string: openid4VPlink) else { throw PresentationSession.makeError(str: "Invalid link \(openid4VPlink)") }
+        NobidLogger.debug("VP: receiveRequest: 2: openid4VPURI=\(openid4VPURI)")
+        siopOpenId4Vp = SiopOpenID4VP(walletConfiguration: getWalletConf(verifierApiUrl: openId4VpVerifierApiUri, verifierLegalName: openId4VpVerifierLegalName), chosenCredentialDict: chosenCredentialDict)
+        NobidLogger.debug("VP: receiveRequest: 3: about to send AuthorizationRequest")
 			switch try await siopOpenId4Vp.authorize(url: openid4VPURI)  {
 			case .notSecured(data: _):
+                NobidLogger.error("VP: receiveRequest: 4: Not secure request received")
 				throw PresentationSession.makeError(str: "Not secure request received.")
 			case let .jwt(request: resolvedRequestData):
+                NobidLogger.debug("VP: receiveRequest: 5: JWT")
 				self.resolvedRequestData = resolvedRequestData
 				switch resolvedRequestData {
 				case let .vpToken(vp):
+                    NobidLogger.debug("VP: receiveRequest: 6: vpToken=\(vp)")
 					if let key = vp.clientMetaData?.jwkSet?.keys.first(where: { $0.use == "enc"}), let x = key.x, let xd = Data(base64URLEncoded: x), let y = key.y, let yd = Data(base64URLEncoded: y), let crv = key.crv, let crvType = MdocDataModel18013.CoseEcCurve(crvName: crv)  {
 						logger.info("Found jwks public key with curve \(crv)")
 						eReaderPub = CoseKey(x: [UInt8](xd), y: [UInt8](yd), crv: crvType)
+                        NobidLogger.debug("VP: receiveRequest: 7: Found jwks public key with curve \(crv)")
 					}
 					let responseUri = if case .directPostJWT(let uri) = vp.responseMode { uri.absoluteString } else { "" }
 					vpNonce = vp.nonce; vpClientId = vp.client.id.originalClientId
@@ -123,20 +135,27 @@ public final class OpenId4VpService: @unchecked Sendable, PresentationService {
 					sessionTranscript = Openid4VpUtils.generateSessionTranscript(clientId: vp.client.id.originalClientId,
 						responseUri: responseUri, nonce: vp.nonce, mdocGeneratedNonce: mdocGeneratedNonce)
 					logger.info("Session Transcript: \(sessionTranscript.encode().toHexString()), for clientId: \(vp.client.id), responseUri: \(responseUri), nonce: \(vp.nonce), mdocGeneratedNonce: \(mdocGeneratedNonce!)")
+                    NobidLogger.debug("VP: receiveRequest: 9: Session Transcript: \(sessionTranscript.encode().toHexString()), for clientId: \(vp.client.id), responseUri: \(responseUri), nonce: \(vp.nonce), mdocGeneratedNonce: \(mdocGeneratedNonce!)")
 					self.presentationDefinition = vp.presentationDefinition
 					let (items, fmtsReq, imap) = try Openid4VpUtils.parsePresentationDefinition(vp.presentationDefinition, idsToDocTypes: idsToDocTypes, dataFormats: dataFormats, docDisplayNames: docDisplayNames, logger: logger)
+                    NobidLogger.debug("VP: receiveRequest: 10:")
 					self.formatsRequested = fmtsReq; self.inputDescriptorMap = imap
 					guard let items else { throw PresentationSession.makeError(str: "Invalid presentation definition") }
 					var result = UserRequestInfo(docDataFormats: fmtsReq, itemsRequested: items)
 					logger.info("Verifer requested items: \(items.mapValues { $0.mapValues { ar in ar.map(\.elementIdentifier) } })")
+                    NobidLogger.debug("VP: receiveRequest: 12: Verifer requested items: \(items.mapValues { $0.mapValues { ar in ar.map(\.elementIdentifier) } })")
 					if let ln = resolvedRequestData.legalName { result.readerLegalName = ln }
 					if let readerCertificateIssuer {
 						result.readerAuthValidated = readerAuthValidated
 						result.readerCertificateIssuer = MdocHelpers.getCN(from: readerCertificateIssuer)
 						result.readerCertificateValidationMessage = readerCertificateValidationMessage
+                        NobidLogger.debug("VP: receiveRequest: 13: readerCertificateIssuer")
 					}
+                    NobidLogger.success("VP: receiveRequest: 14: result=\(result)")
 					return result
-				default: throw PresentationSession.makeError(str: "SiopAuthentication request received, not supported yet.")
+				default:
+                    NobidLogger.error("VP: receiveRequest: 15:")
+                    throw PresentationSession.makeError(str: "SiopAuthentication request received, not supported yet.")
 				}
 			}
 	}
@@ -158,69 +177,111 @@ public final class OpenId4VpService: @unchecked Sendable, PresentationService {
 	///   - userAccepted: True if user accepted to send the response
 	///   - itemsToSend: The selected items to send organized in document types and namespaces
 	public func sendResponse(userAccepted: Bool, itemsToSend: RequestItems, onSuccess: ((URL?) -> Void)?) async throws {
+        NobidLogger.debug("VP: sendResponse: 1: userAccepted=\(userAccepted); itemsToSend=\(itemsToSend.count)")
 		guard let pd = presentationDefinition, let resolved = resolvedRequestData else {
+            NobidLogger.error("VP: sendResponse: 2: FAILED: presentationDefinition or resolvedRequestData is nil")
 			throw PresentationSession.makeError(str: "Unexpected error")
 		}
+        NobidLogger.debug("VP: sendResponse: 3")
 		guard userAccepted, itemsToSend.count > 0 else {
+            NobidLogger.debug("VP: sendResponse: 4")
 			try await SendVpToken(nil, pd, resolved, onSuccess)
+            NobidLogger.debug("VP: sendResponse: 5")
 			return
 		}
+        NobidLogger.debug("VP: sendResponse: 6: request items: \(itemsToSend.mapValues { $0.mapValues { ar in ar.map(\.elementIdentifier) } })")
 		logger.info("Openid4vp request items: \(itemsToSend.mapValues { $0.mapValues { ar in ar.map(\.elementIdentifier) } })")
-		if unlockData == nil { _ = try await startQrEngagement(secureAreaName: nil, crv: .P256) }
+        if unlockData == nil {
+            NobidLogger.debug("VP: sendResponse: 7")
+            _ = try await startQrEngagement(secureAreaName: nil, crv: .P256)
+        }
+        NobidLogger.debug("VP: sendResponse: 8")
 		if formatsRequested.count == 1, formatsRequested.allSatisfy({ (key: String, value: DocDataFormat) in value == .cbor }) {
+            NobidLogger.debug("VP: sendResponse: 9")
 			makeCborDocs()
 			let vpToken = try await generateCborVpToken(itemsToSend: itemsToSend)
+            NobidLogger.debug("VP: sendResponse: 10")
 			try await SendVpToken([(pd.inputDescriptors.first!.id, vpToken)], pd, resolved, onSuccess)
+            NobidLogger.debug("VP: sendResponse: 11")
 		} else {
+            NobidLogger.debug("VP: sendResponse: 12")
 			if formatsRequested.first(where: { (key: String, value: DocDataFormat) in value == .cbor }) != nil {
+                NobidLogger.debug("VP: sendResponse: 13")
 				makeCborDocs()
 			}
 			let parser = CompactParser()
+            NobidLogger.debug("VP: sendResponse: 14")
 			let docStrings = docs.filter { k,v in Self.filterFormat(dataFormats[k]!, fmt: .sdjwt)}.compactMapValues { String(data: $0, encoding: .utf8) }
+            NobidLogger.debug("VP: sendResponse: 15")
 			docsSdJwt = docStrings.compactMapValues { try? parser.getSignedSdJwt(serialisedString: $0) }
 			var inputToPresentations = [(String, VpToken.VerifiablePresentation)]()
+            NobidLogger.debug("VP: sendResponse: 16")
 			// support sd-jwt documents
 			for (docId, nsItems) in itemsToSend {
+                NobidLogger.debug("VP: sendResponse: 17")
 				guard let docType = idsToDocTypes[docId], let inputDescrId = inputDescriptorMap[docType] else { continue }
 				if dataFormats[docId] == .cbor {
+                    NobidLogger.debug("VP: sendResponse: 18")
 					if docsCbor == nil { makeCborDocs() }
 					let itemsToSend1 = Dictionary(uniqueKeysWithValues: [(docId, nsItems)])
 					let vpToken = try await generateCborVpToken(itemsToSend: itemsToSend1)
+                    NobidLogger.debug("VP: sendResponse: 19")
 					 inputToPresentations.append((inputDescrId, vpToken))
 				} else if dataFormats[docId] == .sdjwt {
+                    NobidLogger.debug("VP: sendResponse: 20")
 					let docSigned = docsSdJwt[docId]; let dpk = devicePrivateKeys[docId]
 					guard let docSigned, let dpk, let items = nsItems.first?.value else { continue }
 					let unlockData = try await dpk.secureArea.unlockKey(id: docId)
+                    NobidLogger.debug("VP: sendResponse: 22")
 					let keyInfo = try await dpk.secureArea.getKeyInfo(id: docId);	let dsa = keyInfo.publicKey.crv.defaultSigningAlgorithm
+                    NobidLogger.debug("VP: sendResponse: 23")
 					let signer = try SecureAreaSigner(secureArea: dpk.secureArea, id: docId, ecAlgorithm: dsa, unlockData: unlockData)
+                    NobidLogger.debug("VP: sendResponse: 24")
 					let signAlg = try SecureAreaSigner.getSigningAlgorithm(dsa)
+                    NobidLogger.debug("VP: sendResponse: 25")
 					let hai = HashingAlgorithmIdentifier(rawValue: docsHashingAlgs[docId] ?? "") ?? .SHA3256
-					guard let presented = try await Openid4VpUtils.getSdJwtPresentation(docSigned, hashingAlg: hai.hashingAlgorithm(), signer: signer, signAlg: signAlg, requestItems: items, nonce: vpNonce, aud: vpClientId) else {
+                    guard let presented = try await Openid4VpUtils.getSdJwtPresentation(docSigned, hashingAlg: hai.hashingAlgorithm(), signer: signer, signAlg: signAlg, requestItems: items, nonce: vpNonce, aud: vpClientId) else {
 						continue
 					}
+                    NobidLogger.debug("VP: sendResponse: 26")
 					inputToPresentations.append((inputDescrId, VpToken.VerifiablePresentation.generic(presented.serialisation)))
 				}
 			}
+            NobidLogger.debug("VP: sendResponse: 27")
 			try await SendVpToken(inputToPresentations, pd, resolved, onSuccess)
+            NobidLogger.success("VP: sendResponse: 28")
 		}
 	}
 	/// Filter document accordind to the raw format value
 	static func filterFormat(_ df: DocDataFormat, fmt: DocDataFormat) -> Bool { df == fmt }
 
 	fileprivate func SendVpToken(_ vpTokens: [(String, VpToken.VerifiablePresentation)]?, _ pd: PresentationDefinition, _ resolved: ResolvedRequestData, _ onSuccess: ((URL?) -> Void)?) async throws {
+        NobidLogger.debug("VP: SendVpToken: 1: vpTokens=\(vpTokens)")
 		let consent: ClientConsent = if let vpTokens {
 			.vpToken(vpToken: .init(apu: mdocGeneratedNonce.base64urlEncode, verifiablePresentations: vpTokens.map(\.1)), presentationSubmission: .init(id: UUID().uuidString, definitionID: pd.id, descriptorMap: vpTokens.enumerated().map { i,v in
 			 let descr = pd.inputDescriptors.first(where: { $0.id == v.0 })!
 			 return DescriptorMap(id: descr.id, format: descr.formatContainer?.formats.first?["designation"].string ?? "", path: vpTokens.count == 1 ? "$" : "$[\(i)]")
 			}))
 		} else { .negative(message: "Rejected") }
+        var vpTokenStr = ""
+        if let vpTokens {
+            NobidLogger.debug("VP: SendVpToken: 2")
+            vpTokenStr = vpTokens.map { $0.0 }.joined(separator: "-")
+        }
+        NobidLogger.debug("VP: SendVpToken: 3: vpToken(s)=\(vpTokenStr)")
+        logger.info("SiopOpenID4VP.response.vpToken(s)=\(vpTokenStr)")
 		// Generate a direct post authorisation response
 		let response = try AuthorizationResponse(resolvedRequest: resolved, consent: consent, walletOpenId4VPConfig: getWalletConf(verifierApiUrl: openId4VpVerifierApiUri, verifierLegalName: openId4VpVerifierLegalName))
+        NobidLogger.debug("VP: SendVpToken: 4:")
+        NobidLogger.dump("VP: SendVpToken: 4: response=\(response)")
 		let result: DispatchOutcome = try await siopOpenId4Vp.dispatch(response: response)
+        NobidLogger.debug("VP: SendVpToken: 5: result=\(result)")
 		if case let .accepted(url) = result {
+            NobidLogger.success("VP: SendVpToken: 6: Dispatch accepted, return url: \(url?.absoluteString ?? "")")
 			logger.info("Dispatch accepted, return url: \(url?.absoluteString ?? "")")
 			onSuccess?(url)
 		} else if case let .rejected(reason) = result {
+            NobidLogger.error("VP: SendVpToken: 7: Dispatch rejected, reason: \(reason)")
 			logger.info("Dispatch rejected, reason: \(reason)")
 			throw PresentationSession.makeError(str: reason)
 		}

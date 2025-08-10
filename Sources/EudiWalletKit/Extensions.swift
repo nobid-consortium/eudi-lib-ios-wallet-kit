@@ -57,7 +57,7 @@ extension Array where Element == MdocDataModel18013.DisplayMetadata {
 extension Display {
 	public var displayMetadata: MdocDataModel18013.DisplayMetadata {
 		let logoMetadata = LogoMetadata(urlString: logo?.uri?.absoluteString, alternativeText: logo?.alternativeText)
-		return MdocDataModel18013.DisplayMetadata(name: name, localeIdentifier: locale?.identifier, logo: logoMetadata, description: description, backgroundColor: backgroundColor, textColor: textColor)
+		return MdocDataModel18013.DisplayMetadata(name: name, localeIdentifier: locale?.identifier, logo: logoMetadata, description: description, backgroundColor: backgroundColor, backgroundImageUrl: backgroundImage, textColor: textColor)
 	}
 }
 
